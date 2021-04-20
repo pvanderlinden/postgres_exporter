@@ -121,7 +121,8 @@ type Mapping map[string]MappingOptions
 type UserQuery struct {
 	Query        string    `yaml:"query"`
 	Metrics      []Mapping `yaml:"metrics"`
-	Master       bool      `yaml:"master"`        // Querying only for master database
+	Master       bool      `yaml:"master"` // Querying only for master database
+	Databases    string    `yaml:"databases"`
 	CacheSeconds uint64    `yaml:"cache_seconds"` // Number of seconds to cache the namespace result metrics for.
 	RunOnServer  string    `yaml:"runonserver"`   // Querying to run on which server version
 }
@@ -163,6 +164,7 @@ func (cm *ColumnMapping) UnmarshalYAML(unmarshal func(interface{}) error) error 
 type intermediateMetricMap struct {
 	columnMappings map[string]ColumnMapping
 	master         bool
+	databases      *regexp.Regexp
 	cacheSeconds   uint64
 }
 
@@ -171,6 +173,7 @@ type MetricMapNamespace struct {
 	labels         []string             // Label names for this namespace
 	columnMappings map[string]MetricMap // Column mappings in this namespace
 	master         bool                 // Call query only for master database
+	databases      *regexp.Regexp       // Call query only for databases matching this regex
 	cacheSeconds   uint64               // Number of seconds this metric namespace can be cached. 0 disables.
 }
 
@@ -230,6 +233,7 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"stats_reset":           {COUNTER, "Time at which these statistics were last reset", nil, nil},
 		},
 		true,
+		nil,
 		0,
 	},
 	"pg_stat_database": {
@@ -255,6 +259,7 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"stats_reset":    {COUNTER, "Time at which these statistics were last reset", nil, nil},
 		},
 		true,
+		nil,
 		0,
 	},
 	"pg_stat_database_conflicts": {
@@ -268,6 +273,7 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"confl_deadlock":   {COUNTER, "Number of queries in this database that have been canceled due to deadlocks", nil, nil},
 		},
 		true,
+		nil,
 		0,
 	},
 	"pg_locks": {
@@ -277,6 +283,7 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"count":   {GAUGE, "Number of locks", nil, nil},
 		},
 		true,
+		nil,
 		0,
 	},
 	"pg_stat_replication": {
@@ -323,6 +330,7 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"replay_lag":               {DISCARD, "Time elapsed between flushing recent WAL locally and receiving notification that this standby server has written, flushed and applied it. This can be used to gauge the delay that synchronous_commit level remote_apply incurred while committing if this server was configured as a synchronous standby.", nil, semver.MustParseRange(">=10.0.0")},
 		},
 		true,
+		nil,
 		0,
 	},
 	"pg_replication_slots": {
@@ -333,6 +341,7 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"pg_wal_lsn_diff": {GAUGE, "Replication lag in bytes", nil, nil},
 		},
 		true,
+		nil,
 		0,
 	},
 	"pg_stat_archiver": {
@@ -347,6 +356,7 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"last_archive_age":   {GAUGE, "Time in seconds since last WAL segment was successfully archived", nil, nil},
 		},
 		true,
+		nil,
 		0,
 	},
 	"pg_stat_activity": {
@@ -357,6 +367,7 @@ var builtinMetricMaps = map[string]intermediateMetricMap{
 			"max_tx_duration": {GAUGE, "max duration in seconds any active transaction has been running", nil, nil},
 		},
 		true,
+		nil,
 		0,
 	},
 }
@@ -540,6 +551,9 @@ func parseUserQueries(content []byte) (map[string]intermediateMetricMap, map[str
 				columnMappings: newMetricMap,
 				master:         specs.Master,
 				cacheSeconds:   specs.CacheSeconds,
+			}
+			if len(specs.Databases) > 0 {
+				metricMap.databases = regexp.MustCompile(specs.Databases)
 			}
 			metricMaps[metric] = metricMap
 		}
@@ -732,7 +746,7 @@ func makeDescMap(pgVersion semver.Version, serverLabels prometheus.Labels, metri
 			}
 		}
 
-		metricMap[namespace] = MetricMapNamespace{variableLabels, thisMap, intermediateMappings.master, intermediateMappings.cacheSeconds}
+		metricMap[namespace] = MetricMapNamespace{variableLabels, thisMap, intermediateMappings.master, intermediateMappings.databases, intermediateMappings.cacheSeconds}
 	}
 
 	return metricMap
@@ -933,6 +947,7 @@ type Server struct {
 	labels      prometheus.Labels
 	master      bool
 	runonserver string
+	datname     string
 
 	// Last version used to calculate metric map. If mismatch on scrape,
 	// then maps are recalculated.
@@ -975,6 +990,10 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 
 	level.Info(logger).Log("msg", "Established new database connection", "fingerprint", fingerprint)
 
+	datname, err := currentDatabase(db)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		db:     db,
 		master: false,
@@ -982,6 +1001,7 @@ func NewServer(dsn string, opts ...ServerOpt) (*Server, error) {
 			serverLabelName: fingerprint,
 		},
 		metricCache: make(map[string]cachedMetrics),
+		datname:     datname,
 	}
 
 	for _, opt := range opts {
@@ -1275,6 +1295,22 @@ func newDesc(subsystem, name, help string, labels prometheus.Labels) *prometheus
 	)
 }
 
+func currentDatabase(db *sql.DB) (string, error) {
+	rows, err := db.Query("SELECT current_database()")
+	if err != nil {
+		return "", fmt.Errorf("Error retrieving database: %v", err)
+	}
+	defer rows.Close() // nolint: errcheck
+
+	var databaseName string
+	rows.Next()
+	err = rows.Scan(&databaseName)
+	if err != nil {
+		return databaseName, errors.New(fmt.Sprintln("Error retrieving rows:", err))
+	}
+	return databaseName, nil
+}
+
 func queryDatabases(server *Server) ([]string, error) {
 	rows, err := server.db.Query("SELECT datname FROM pg_database WHERE datallowconn = true AND datistemplate = false AND datname != current_database()")
 	if err != nil {
@@ -1463,7 +1499,7 @@ func queryNamespaceMappings(ch chan<- prometheus.Metric, server *Server) map[str
 		level.Debug(logger).Log("msg", "Querying namespace", "namespace", namespace)
 
 		if mapping.master && !server.master {
-			level.Debug(logger).Log("msg", "Query skipped...")
+			level.Debug(logger).Log("msg", "Query skipped (not the master server)...")
 			continue
 		}
 
@@ -1475,6 +1511,11 @@ func queryNamespaceMappings(ch chan<- prometheus.Metric, server *Server) map[str
 				level.Debug(logger).Log("msg", "Query skipped for this database version", "version", server.lastMapVersion.String(), "target_version", server.runonserver)
 				continue
 			}
+		}
+
+		if mapping.databases != nil && !mapping.databases.MatchString(server.datname) {
+			level.Debug(logger).Log("msg", "Query skipped (not matching database filter)...")
+			continue
 		}
 
 		scrapeMetric := false
@@ -1716,6 +1757,7 @@ func (e *Exporter) discoverDatabaseDSNs() []string {
 }
 
 func (e *Exporter) scrapeDSN(ch chan<- prometheus.Metric, dsn string) error {
+	level.Debug(logger).Log("msg", "Scraping dsn", "dsn", dsn)
 	server, err := e.servers.GetServer(dsn)
 
 	if err != nil {
